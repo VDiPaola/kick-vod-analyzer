@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kick-vod-analyser"
+version = "0.1.0"
+description = "Activity detection and segmentation for Kick VOD archives"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "pydantic-settings",
+    "pillow",
+    "yt-dlp",
+    "httpx",
+    "python-dotenv",
+    "typer",
+    "rich",
+]
+
+[project.optional-dependencies]
+gemini = ["google-genai"]
+openai = ["openai"]
+kick = ["curl_cffi"]
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+kick-vod-analyser = "kick_vod_analyser.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kick_vod_analyser"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
