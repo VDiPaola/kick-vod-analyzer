@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kick VOD Analyser</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2f3a; --text: #e6e8ee; --muted: #8b92a5;
+    --accent: #53b1fd; --ok: #4ade80; --warn: #fbbf24; --err: #f87171; --mono: ui-monospace, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; margin: 0; }
+  header .stats { display: flex; gap: 14px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px 20px; min-height: calc(100vh - 50px); }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  form label.wide { grid-column: 1 / -1; }
+  form label.check { flex-direction: row; align-items: center; gap: 6px; }
+  input, select, button { font: inherit; color: var(--text); background: #0f1115; border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; }
+  button { cursor: pointer; background: #1f2937; }
+  button.primary { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+  button.small { padding: 2px 8px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.job { cursor: pointer; }
+  tr.job:hover, tr.job.selected { background: #1f2430; }
+  .status { font-family: var(--mono); font-size: 12px; padding: 1px 6px; border-radius: 4px; }
+  .status.queued { color: var(--muted); border: 1px solid var(--border); }
+  .status.running { color: var(--accent); border: 1px solid var(--accent); }
+  .status.succeeded { color: var(--ok); border: 1px solid var(--ok); }
+  .status.failed { color: var(--err); border: 1px solid var(--err); }
+  .status.cancelled { color: var(--warn); border: 1px solid var(--warn); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .muted { color: var(--muted); }
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+  pre { margin: 0; background: #0f1115; border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: 12px/1.5 var(--mono); overflow: auto; max-height: 360px; white-space: pre-wrap; word-break: break-word; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .tabs button.active { border-color: var(--accent); color: var(--accent); }
+  #msg { color: var(--err); font-size: 12px; grid-column: 1 / -1; min-height: 1em; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kick VOD Analyser</h1>
+  <div class="stats" id="stats">loading</div>
+  <div style="margin-left:auto" class="row">
+    <label class="muted" style="font-size:12px"><input type="checkbox" id="auto" checked> auto refresh</label>
+    <a class="muted" href="/docs" style="font-size:12px">API docs</a>
+  </div>
+</header>
+<main>
+  <div class="stack">
+    <section>
+      <h2>Queue a VOD</h2>
+      <form id="form">
+        <label class="wide">Kick VOD URL <input name="url" required placeholder="https://kick.com/channel/videos/uuid"></label>
+        <label>Provider <select name="provider"><option>gemini</option><option>openai</option><option>mock</option></select></label>
+        <label>Mode <select name="mode"><option>sync</option><option>batch</option></select></label>
+        <label>Model override <input name="model" placeholder="provider default"></label>
+        <label>Max samples <input name="max_samples" type="number" min="0" placeholder="0 = unlimited"></label>
+        <label>Chat <select name="chat"><option>none</option><option>kick</option><option>file</option></select></label>
+        <label>Chat file <input name="chat_file" placeholder="path, when chat = file"></label>
+        <label>Scene threshold <input name="scene_threshold" type="number" step="0.01" min="0" max="1" placeholder="0.35"></label>
+        <label>Heartbeat seconds <input name="heartbeat_seconds" type="number" min="1" placeholder="900"></label>
+        <label class="check"><input type="checkbox" name="dry_run"> dry run</label>
+        <label class="check"><input type="checkbox" name="resume" checked> resume from cache</label>
+        <label class="check"><input type="checkbox" name="keep_frames"> keep frames</label>
+        <label class="check"><input type="checkbox" name="wait_for_batch" checked> wait for batch</label>
+        <div id="msg"></div>
+        <button class="primary wide" type="submit" style="grid-column: 1 / -1">Queue job</button>
+      </form>
+    </section>
+    <section>
+      <h2>Worker log</h2>
+      <pre id="logs" class="muted">no log lines yet</pre>
+    </section>
+  </div>
+  <div class="stack">
+    <section>
+      <div class="row" style="justify-content: space-between; margin-bottom: 8px">
+        <h2 style="margin:0">Jobs</h2>
+        <select id="filter"><option value="">all statuses</option><option>queued</option><option>running</option><option>succeeded</option><option>failed</option><option>cancelled</option></select>
+      </div>
+      <table>
+        <thead><tr><th>Status</th><th>URL</th><th>Provider</th><th>Stage</th><th>Created</th><th>Took</th><th></th></tr></thead>
+        <tbody id="jobs"><tr><td colspan="7" class="muted">no jobs</td></tr></tbody>
+      </table>
+    </section>
+    <section id="detail" hidden>
+      <div class="row" style="justify-content: space-between">
+        <h2 id="detail-title" style="margin:0">Job</h2>
+        <div class="row">
+          <button class="small" id="btn-retry">Retry</button>
+          <button class="small" id="btn-cancel">Cancel</button>
+          <button class="small" id="btn-delete">Delete record</button>
+        </div>
+      </div>
+      <dl class="kv" id="detail-kv" style="margin: 10px 0"></dl>
+      <div class="tabs" id="tabs">
+        <button data-tab="events" class="active">Events</button>
+        <button data-tab="result">Result</button>
+        <button data-tab="outputs">Outputs</button>
+        <button data-tab="request">Request</button>
+        <button data-tab="error">Error</button>
+      </div>
+      <pre id="tab-events"></pre>
+      <pre id="tab-result" hidden></pre>
+      <div id="tab-outputs" hidden></div>
+      <pre id="tab-request" hidden></pre>
+      <pre id="tab-error" hidden></pre>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { jobs: [], selected: null, tab: "events", eventCursor: 0, eventText: "" };
+
+const fmtTime = (t) => t ? new Date(t * 1000).toLocaleTimeString() : "";
+const fmtDur = (s) => {
+  if (s == null) return "";
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${sec}s` : `${sec}s`;
+};
+const took = (j) => j.started_at ? fmtDur((j.finished_at || Date.now() / 1000) - j.started_at) : "";
+const shortUrl = (u) => u.replace(/^https?:\/\/(www\.)?kick\.com\//, "");
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail ? JSON.stringify(body.detail) : res.statusText);
+  return body;
+}
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("msg").textContent = "";
+  const fd = new FormData(e.target);
+  const body = { url: fd.get("url"), provider: fd.get("provider"), mode: fd.get("mode"), chat: fd.get("chat") };
+  for (const k of ["model", "chat_file"]) if (fd.get(k)) body[k] = fd.get(k);
+  for (const k of ["max_samples", "scene_threshold", "heartbeat_seconds"]) if (fd.get(k) !== "") body[k] = Number(fd.get(k));
+  for (const k of ["dry_run", "resume", "keep_frames", "wait_for_batch"]) body[k] = fd.get(k) === "on";
+  try {
+    const job = await api("/jobs", { method: "POST", body: JSON.stringify(body) });
+    select(job.job_id);
+    await refresh();
+  } catch (err) { $("msg").textContent = err.message; }
+});
+
+$("filter").addEventListener("change", refresh);
+$("tabs").addEventListener("click", (e) => {
+  if (e.target.dataset.tab) { state.tab = e.target.dataset.tab; renderDetail(); }
+});
+$("btn-cancel").onclick = () => act(`/jobs/${state.selected}`, "DELETE");
+$("btn-retry").onclick = () => act(`/jobs/${state.selected}/retry`, "POST", true);
+$("btn-delete").onclick = async () => {
+  if (!confirm("Delete this job record?")) return;
+  await act(`/jobs/${state.selected}/record`, "DELETE");
+  state.selected = null; $("detail").hidden = true; refresh();
+};
+
+async function act(path, method, followNew) {
+  try {
+    const out = await api(path, { method });
+    if (followNew && out && out.job_id) select(out.job_id);
+    await refresh();
+  } catch (err) { alert(err.message); }
+}
+
+function select(id) {
+  state.selected = id; state.eventCursor = 0; state.eventText = "";
+  $("detail").hidden = false;
+  refresh();
+}
+
+async function refresh() {
+  try {
+    const [queue, jobs, logs] = await Promise.all([
+      api("/queue"),
+      api(`/jobs?limit=200${$("filter").value ? "&status=" + $("filter").value : ""}`),
+      api("/logs?limit=120"),
+    ]);
+    state.jobs = jobs;
+    $("stats").innerHTML = `worker ${queue.worker_alive ? "<span style='color:var(--ok)'>alive</span>" : "<span style='color:var(--err)'>dead</span>"}`
+      + ` | queued ${queue.queued} | running ${queue.running} | ok ${queue.succeeded} | failed ${queue.failed} | cancelled ${queue.cancelled}`;
+    renderJobs();
+    $("logs").textContent = logs.length ? logs.map(l => `${fmtTime(l.at)} ${l.level.padEnd(7)} ${l.message}`).join("\n") : "no log lines yet";
+    $("logs").scrollTop = $("logs").scrollHeight;
+    if (state.selected) await loadDetail();
+  } catch (err) { $("stats").textContent = "server unreachable: " + err.message; }
+}
+
+function renderJobs() {
+  const tbody = $("jobs");
+  if (!state.jobs.length) { tbody.innerHTML = `<tr><td colspan="7" class="muted">no jobs</td></tr>`; return; }
+  tbody.innerHTML = state.jobs.map(j => `
+    <tr class="job ${j.job_id === state.selected ? "selected" : ""}" data-id="${j.job_id}">
+      <td><span class="status ${j.status}">${j.status}</span></td>
+      <td class="mono" title="${j.request.url}">${shortUrl(j.request.url)}${j.request.dry_run ? " <span class=muted>(dry)</span>" : ""}</td>
+      <td class="mono">${j.request.provider}/${j.request.mode}</td>
+      <td class="mono">${j.stage || ""}</td>
+      <td class="mono">${fmtTime(j.created_at)}</td>
+      <td class="mono">${took(j)}</td>
+      <td>${j.status === "queued" ? `<button class="small" data-cancel="${j.job_id}">cancel</button>` : ""}</td>
+    </tr>`).join("");
+  tbody.querySelectorAll("tr.job").forEach(tr => tr.onclick = (e) => {
+    if (e.target.dataset.cancel) { act(`/jobs/${e.target.dataset.cancel}`, "DELETE"); return; }
+    select(tr.dataset.id);
+  });
+}
+
+async function loadDetail() {
+  let job;
+  try { job = await api(`/jobs/${state.selected}`); }
+  catch { state.selected = null; $("detail").hidden = true; return; }
+  const page = await api(`/jobs/${job.job_id}/events?after=${state.eventCursor}`);
+  if (page.events.length) {
+    state.eventText += (state.eventText ? "\n" : "") + page.events.map(ev => `${fmtTime(ev.at)} ${ev.stage.padEnd(9)} ${ev.message}`).join("\n");
+    state.eventCursor = page.cursor;
+  }
+  const outputs = job.result ? await api(`/jobs/${job.job_id}/outputs`) : [];
+  state.detail = { job, outputs };
+  renderDetail();
+}
+
+function renderDetail() {
+  if (!state.detail) return;
+  const { job, outputs } = state.detail;
+  $("detail-title").textContent = `Job ${job.job_id.slice(0, 8)}`;
+  $("btn-cancel").disabled = job.status !== "queued";
+  $("btn-retry").disabled = !["succeeded", "failed", "cancelled"].includes(job.status);
+  $("btn-delete").disabled = !["succeeded", "failed", "cancelled"].includes(job.status);
+  const r = job.result || {};
+  const rows = [
+    ["status", `<span class="status ${job.status}">${job.status}</span>`],
+    ["url", job.request.url],
+    ["vod", r.vod_id ? `${r.channel_slug} / ${r.title || ""} (${fmtDur(r.duration_seconds)}) [${r.vod_id}]` : "-"],
+    ["stage", job.stage || "-"],
+    ["timing", `created ${fmtTime(job.created_at)}${job.started_at ? " | started " + fmtTime(job.started_at) : ""}${job.finished_at ? " | finished " + fmtTime(job.finished_at) : ""}${took(job) ? " | took " + took(job) : ""}`],
+    ["counts", job.result ? `${r.sample_points} points, ${r.grids} grids, ${r.results} results, ${r.segments} segments` : "-"],
+    ["cost", r.cost && r.cost.total_cost_usd != null ? `$${r.cost.total_cost_usd.toFixed(4)} (${r.cost.requests} requests)` : "-"],
+    ["batch job", r.batch_job_id || "-"],
+  ];
+  $("detail-kv").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === state.tab));
+  for (const t of ["events", "result", "outputs", "request", "error"]) $("tab-" + t).hidden = t !== state.tab;
+  $("tab-events").textContent = state.eventText || "no events yet";
+  $("tab-events").scrollTop = $("tab-events").scrollHeight;
+  $("tab-result").textContent = job.result ? JSON.stringify(job.result, null, 2) : "no result yet";
+  $("tab-request").textContent = JSON.stringify(job.request, null, 2);
+  $("tab-error").textContent = job.error || (r.errors && r.errors.length ? r.errors.join("\n") : "no errors");
+  $("tab-outputs").innerHTML = outputs.length
+    ? `<table><thead><tr><th>Name</th><th>Path</th><th>Size</th><th></th></tr></thead><tbody>` + outputs.map(o => `
+        <tr><td class="mono">${o.name}</td><td class="mono">${o.path}</td><td class="mono">${o.size_bytes}</td>
+        <td>${o.exists ? `<a href="/jobs/${job.job_id}/outputs/${o.name}" target="_blank">open</a>` : "<span class=muted>missing</span>"}</td></tr>`).join("") + `</tbody></table>`
+    : `<span class="muted">no outputs</span>`;
+}
+
+setInterval(() => { if ($("auto").checked) refresh(); }, 2000);
+refresh();
+</script>
+</body>
+</html>

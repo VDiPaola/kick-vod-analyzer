@@ -75,6 +75,7 @@ Extras:
 
 - `gemini` - the Google Gemini client
 - `openai` - the OpenAI client
+- `api` - FastAPI and uvicorn for the REST API and debug UI
 - `kick` - `curl_cffi`, for browser TLS impersonation. Kick sits behind
   Cloudflare and rejects the default Python TLS fingerprint, so without this
   extra every Kick request returns 403.
@@ -403,6 +404,88 @@ flags taking precedence.
 | `KVA_SMOOTHING_CONFIRM_CONSECUTIVE` | `2` |
 | `KVA_SMOOTHING_MIN_CONFIDENCE` | `0.35` |
 
+## REST API and debug UI
+
+`serve` starts an HTTP API for queueing analyses plus a browser UI for watching
+them run. Install the extra first:
+
+```bash
+pip install -e ".[api]"
+python -m kick_vod_analyser.cli serve --port 8765
+```
+
+Open `http://127.0.0.1:8765/` for the debug UI and `/docs` for the interactive
+OpenAPI reference. `--work-dir`, `--out-dir`, `--host`, and `-v` work as on
+`analyse`.
+
+Jobs run one at a time on a background worker, in submission order. The queue
+is persisted to `work/jobs.sqlite`, so it survives restarts; a job that was
+running when the process stopped is marked `failed` on the next start.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/jobs` | Queue a VOD. Returns `202` and the job |
+| `GET` | `/jobs?status=&limit=` | List jobs, newest first |
+| `GET` | `/jobs/{id}` | Job status, stage, result, error |
+| `DELETE` | `/jobs/{id}` | Cancel a queued job. `409` if it already started |
+| `POST` | `/jobs/{id}/retry` | Queue a finished job again with the same request |
+| `DELETE` | `/jobs/{id}/record` | Delete a finished job's record and events |
+| `GET` | `/jobs/{id}/events?after=` | Progress events. Pass the returned `cursor` back as `after` to tail |
+| `GET` | `/jobs/{id}/outputs` | Output files with existence and size |
+| `GET` | `/jobs/{id}/outputs/{name}` | Download one output (`timeline_json`, `chapters_vtt`, `segments_csv`, `summary_md`) |
+| `GET` | `/queue` | Worker liveness, current job, counts per status |
+| `GET` | `/logs?limit=` | Recent worker log lines |
+| `GET` | `/health` | Liveness and version |
+
+Job statuses: `queued`, `running`, `succeeded`, `failed`, `cancelled`.
+
+### Queueing a job
+
+The request body mirrors the `analyse` flags. Only `url` is required:
+
+```bash
+curl -X POST http://127.0.0.1:8765/jobs   -H "content-type: application/json"   -d '{"url": "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65", "provider": "gemini", "mode": "batch", "max_samples": 50}'
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `url` | required | Kick VOD URL |
+| `provider` | `gemini` | `gemini`, `openai`, or `mock` |
+| `model` | provider default | Model id override |
+| `mode` | `sync` | `sync` or `batch` |
+| `chat` | `none` | `none`, `file`, or `kick` |
+| `chat_file` | | Required when `chat` is `file` |
+| `scene_threshold` | settings | 0 to 1 |
+| `heartbeat_seconds` | settings | Seconds between fallback checkpoints |
+| `max_samples` | settings | 0 for unlimited |
+| `resume` | `true` | Reuse cached scenes and classifications |
+| `keep_frames` | `false` | Retain raw burst frames |
+| `dry_run` | `false` | Plan and cost only |
+| `wait_for_batch` | `true` | Poll a batch job until it finishes |
+
+Poll `/jobs/{id}` until `status` is terminal, then read `result.outputs` or
+fetch the files through `/jobs/{id}/outputs/{name}`. A `failed` job carries the
+traceback or the pipeline's error list in `error`.
+
+### Debug UI
+
+The page at `/` shows the queue counts, a submission form, the job list with a
+status filter, and a detail panel per job with tabs for progress events, the
+result summary, output files (with download links), the original request, and
+errors. The worker log panel tails the most recent log lines. It refreshes every
+two seconds; untick "auto refresh" to freeze it.
+
+### Embedding
+
+`create_app(settings)` returns a FastAPI application, so it can be mounted
+inside another ASGI app or run directly:
+
+```bash
+uvicorn --factory kick_vod_analyser.api.app:build_default_app --port 8765
+```
+
 ## Library use
 
 Save as `example.py` in the project root and run `python example.py`:
@@ -463,7 +546,7 @@ python -m pytest tests/test_smoothing.py -v
 python -m pytest tests/test_smoothing.py::TestAltTabAbsorption -v
 ```
 
-489 tests, 96% line coverage. The suite includes real ffmpeg integration:
+585 tests, 96% line coverage. The suite includes real ffmpeg integration:
 `tests/conftest.py` builds a 90-second synthetic clip with three visually
 distinct acts, and the sampling, extraction, and end-to-end pipeline tests run
 against it. Provider and network paths are exercised through fakes; no test
@@ -535,6 +618,10 @@ and re-running only repeats the classification step.
 ```
 src/kick_vod_analyser/
   cli.py             command line interface
+  api/
+    app.py           FastAPI routes
+    jobs.py          persistent job queue and worker thread
+    ui.html          debug interface
   pipeline.py        stage orchestration, caching, batch polling
   config.py          settings
   models.py          pydantic domain models

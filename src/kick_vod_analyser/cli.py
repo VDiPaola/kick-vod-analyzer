@@ -212,6 +212,29 @@ def chat(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port"),
+    work_dir: Optional[Path] = typer.Option(None, "--work-dir"),
+    out_dir: Optional[Path] = typer.Option(None, "--out-dir"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Start the REST API and debug UI. Requires the api extra."""
+    configure_logging(verbose)
+    try:
+        import uvicorn
+
+        from .api import create_app
+    except ImportError as exc:
+        console.print(f"[red]api extra not installed: {exc}. Run pip install -e \".[api]\"[/red]")
+        raise typer.Exit(code=1)
+
+    settings = build_settings(work_dir, out_dir)
+    console.print(f"debug UI at [bold]http://{host}:{port}/[/bold], OpenAPI at /docs")
+    uvicorn.run(create_app(settings), host=host, port=port, log_level="debug" if verbose else "info")
+
+
 def _progress(stage: str, message: str) -> None:
     console.print(f"[dim]{stage:>8}[/dim]  {message}")
 
