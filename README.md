@@ -1,22 +1,122 @@
 # Kick VOD Analyser
 
-Turns a full-length Kick VOD into a timestamped activity timeline: which game was
-on screen, when the streamer switched to reacting to videos, when they went AFK.
+Paste in the link to a Kick stream recording (a VOD) and get back a timeline of
+what the streamer was doing, minute by minute: which game was on screen, when
+they switched to watching videos, when they stepped away from the desk.
 
-A 12-hour VOD costs a few cents to classify.
+The tool takes screenshots at the moments the picture changes, asks an AI model
+what it sees, and stitches the answers into chapters you can open in a video
+player or a spreadsheet. A 12-hour VOD costs a few cents to process.
 
-## What it produces
+**New here?** Read [Quick start](#quick-start), then [What you get](#what-you-get).
+Everything after that is reference material.
+
+## Contents
+
+**Getting started**
+
+- [Quick start](#quick-start)
+- [What you get](#what-you-get)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Running commands](#running-commands)
+
+**Using the command line**
+
+- [Usage](#usage)
+- [Options](#options)
+- [Chat](#chat)
+- [Cost](#cost)
+- [Caching and resume](#caching-and-resume)
+- [Batch mode](#batch-mode)
+- [Configuration](#configuration)
+
+**Other ways to use it**
+
+- [REST API and debug UI](#rest-api-and-debug-ui)
+- [Library use](#library-use)
+
+**Reference**
+
+- [Categories](#categories)
+- [Temporal smoothing](#temporal-smoothing)
+- [Rate limits and transient errors](#rate-limits-and-transient-errors)
+- [Tests](#tests)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Known limitations](#known-limitations)
+- [Glossary](#glossary)
+
+## Quick start
+
+Five steps from nothing to a finished timeline.
+
+1. Install Python 3.11 or newer and [ffmpeg](https://ffmpeg.org/download.html).
+   Check both work: `python --version` and `ffmpeg -version`.
+2. From the project folder, install the tool:
+
+   ```bash
+   pip install -e ".[gemini,kick,dev]"
+   ```
+
+3. Get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/)
+   and save it in a file named `.env.local` in the project folder:
+
+   ```
+   GEMINI_API_KEY=your-key-here
+   ```
+
+4. Try a small run first. This classifies only 5 points, so a mistake costs a
+   fraction of a cent:
+
+   ```bash
+   python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --provider gemini --chat none --max-samples 5
+   ```
+
+5. Open the summary:
+
+   ```bash
+   cat out/<vod_id>/summary_report.md
+   ```
+
+Drop `--max-samples 5` for a full run. Add `--mode batch` to pay half price in
+exchange for waiting up to 24 hours. See [Usage](#usage) for more examples.
+
+No API key yet? Use `--provider mock` to run the whole pipeline for free with
+made-up verdicts, just to see the outputs.
+
+## What you get
 
 Four files per VOD, in `out/<vod_id>/`:
 
 | File | Purpose |
 | --- | --- |
-| `timeline.json` | Machine-readable segments plus every individual sample, for downstream tools |
-| `chapters.vtt` | WebVTT chapter track. Drop it into VLC or a web player |
+| `summary_report.md` | Human-readable overview: duration per game, AFK share, timeline table. Start here |
+| `chapters.vtt` | Chapter track. Drop it into VLC or a web player to jump between activities |
 | `segments.csv` | Flat table for spreadsheets and dataframes |
-| `summary_report.md` | Human-readable overview: duration per game, AFK share, timeline table |
+| `timeline.json` | Machine-readable segments plus every individual sample, for downstream tools |
+
+Each segment carries a category (see [Categories](#categories)), a specific title
+such as the game name, a sub-activity, an on-screen flag, an AFK flag, and a
+confidence score.
 
 ## How it works
+
+In plain terms:
+
+1. The tool reads the VOD once at very low quality and notes every moment the
+   picture changes noticeably (a scene change). It also drops a checkpoint every
+   15 minutes so long, unchanging stretches are still covered.
+2. At each of those moments it grabs four higher-quality screenshots spanning
+   12 seconds and tiles them into one image.
+3. Optionally, it collects what chat was saying around that moment.
+4. The image and chat go to an AI model, which answers with a category, a title,
+   and a confidence score.
+5. The answers are cleaned up so that a quick alt-tab or loading screen does not
+   split a gaming session into pieces.
+6. The result is written out as the four files above.
+
+The same pipeline as a diagram:
 
 ```
 Kick VOD URL
@@ -40,7 +140,9 @@ Kick VOD URL
      +-- timeline.json / chapters.vtt / segments.csv / summary_report.md
 ```
 
-Four design choices carry most of the cost and runtime savings:
+### Design choices
+
+Four decisions carry most of the cost and runtime savings.
 
 **One grid image instead of four frames.** A 2x2 composite costs roughly a
 quarter of the vision tokens of four separate images, and gives the model a
@@ -73,13 +175,13 @@ pip install -e ".[gemini,kick,dev]"
 
 Extras:
 
-- `gemini` - the Google Gemini client
-- `openai` - the OpenAI client
-- `api` - FastAPI and uvicorn for the REST API and debug UI
-- `kick` - `curl_cffi`, for browser TLS impersonation. Kick sits behind
-  Cloudflare and rejects the default Python TLS fingerprint, so without this
-  extra every Kick request returns 403.
-- `dev` - pytest and coverage
+| Extra | Installs | Needed for |
+| --- | --- | --- |
+| `gemini` | Google Gemini client | Classifying with Gemini (the default) |
+| `openai` | OpenAI client | Classifying with OpenAI models |
+| `kick` | `curl_cffi` | Talking to Kick at all. Kick sits behind Cloudflare and rejects the default Python TLS fingerprint, so without this every Kick request returns 403 |
+| `api` | FastAPI and uvicorn | The [REST API and debug UI](#rest-api-and-debug-ui) |
+| `dev` | pytest and coverage | Running the [tests](#tests) |
 
 Then create `.env.local` in the project root with the key for whichever provider
 you use:
@@ -88,7 +190,7 @@ you use:
 GEMINI_API_KEY=your-key-here
 ```
 
-### How to invoke it
+## Running commands
 
 Two forms work. Use the module form unless you have confirmed the console script
 is on your `PATH`:
@@ -105,6 +207,16 @@ interchangeable with `python -m kick_vod_analyser.cli` in every example below.
 
 On Windows, prefix commands with `PYTHONIOENCODING=utf-8` if a stream title
 contains emoji, otherwise printing the title can raise a `UnicodeEncodeError`.
+
+Commands:
+
+| Command | What it does | Costs money? |
+| --- | --- | --- |
+| `info` | Show a VOD's title, duration, and available qualities | No |
+| `estimate` | Predict the cost of a run | No |
+| `chat` | Download the VOD's chat replay to a file | No |
+| `analyse` | Build the activity timeline | Yes, unless `--dry-run` or `--provider mock` |
+| `serve` | Start the REST API and debug UI | Only when jobs run |
 
 ## Usage
 
@@ -148,7 +260,7 @@ python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0
 **Full run**, batched at half price, chat enabled:
 
 ```bash
-python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --provider gemini --mode batch
+python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --provider gemini --mode batch --chat kick
 ```
 
 Results land in `out/<vod_id>/`. Scene detection and classifications are cached
@@ -162,14 +274,16 @@ later run on that VOD starts from the cache.
 cat out/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65/summary_report.md
 ```
 
-### Options
+## Options
+
+Flags for `analyse`:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--provider` | `gemini` | `gemini`, `openai`, or `mock` |
 | `--model` | provider default | Override the model id |
 | `--mode` | `sync` | `sync` returns immediately; `batch` is half price with a 24h window |
-| `--chat` | `none` | `none`, `file`, or `kick` (see below) |
+| `--chat` | `none` | `none`, `file`, or `kick` (see [Chat](#chat)) |
 | `--chat-file` | | Chat JSON or JSONL, required when `--chat file` |
 | `--scene-threshold` | `0.35` | Higher means fewer scene triggers |
 | `--heartbeat` | `900` | Seconds between fallback checkpoints |
@@ -183,6 +297,11 @@ Use `mock` as the provider to exercise the whole pipeline without credentials or
 cost. It derives a deterministic verdict from each grid image.
 
 ## Chat
+
+Chat is optional context for the AI model. Without it the classifier works from
+the screenshots alone and lowers its confidence where the visuals are ambiguous.
+Chat matters most for reaction content, where the browser window alone does not
+say what is being watched.
 
 Kick publishes no documented VOD chat API, but the web player's replay endpoint
 is reachable without a login and returns complete history. The pipeline still
@@ -264,10 +383,6 @@ text plus something to place it on the timeline:
 {"offset_seconds": 1234.5, "username": "viewer", "text": "what game is this"}
 ```
 
-Without chat the classifier runs vision-only and lowers its confidence where the
-visuals are ambiguous. Chat matters most for reaction content, where the browser
-window alone does not say what is being watched.
-
 ### Chat window construction
 
 For each sample point, messages within +/-45 seconds are collapsed into at most
@@ -281,29 +396,6 @@ For each sample point, messages within +/-45 seconds are collapsed into at most
 - Lines are ranked by how much they say about what is on screen. Phrases like
   "what game is this" outrank spam volume, which is capped so a repeat wave can
   never displace a viewer naming the content.
-
-## Temporal smoothing
-
-Raw per-sample verdicts fragment badly: streamers alt-tab, games show loading
-screens, the model occasionally misreads a frame. Smoothing enforces three
-rules.
-
-**A single verdict never confirms a transition.** A state earns its own segment
-by being observed repeatedly: `confirm_consecutive` samples agreeing, or two
-samples spread past `min_segment_seconds`.
-
-**A-B-A sandwiches rejoin A.** A brief desktop click or loading screen between
-two stretches of the same game is absorbed. The absorption is bounded, because
-rewriting 30 seconds is smoothing and rewriting 700 seconds is fabrication.
-
-**The bound scales with the sampling cadence.** At a 900-second heartbeat, the
-gap around a lone verdict is dominated by how often you sampled, not by how long
-the interruption lasted, so anything under half a sampling interval is treated
-as unresolvable. At a 60-second cadence the same gap is well resolved and the
-state is kept.
-
-Low-confidence samples carry the current state forward rather than opening a new
-one: a hesitant verdict is weaker evidence than continuity.
 
 ## Cost
 
@@ -341,16 +433,6 @@ A second run reuses both and classifies only what is new. `--no-resume` forces a
 fresh pass. Changing the model invalidates classifications but not scene
 detection, so trying a different model does not re-download the VOD.
 
-## Rate limits and transient errors
-
-Synchronous classification retries each request on rate-limit and server
-errors (HTTP 408, 429, 5xx, or messages mentioning quota, rate limit, or
-overload). Up to 8 attempts per request. The wait honours the provider's
-`Retry-After` header or Gemini's `retryDelay` hint when present, otherwise it
-backs off exponentially from 2s, capped at 120s. Free-tier quota exhaustion
-pauses the run instead of failing it. Errors that are not transient (bad API
-key, invalid request) are recorded against the sample and the run continues.
-
 ## Batch mode
 
 Batch halves the token price in exchange for an asynchronous turnaround of up to
@@ -382,27 +464,27 @@ step repeats.
 ## Configuration
 
 Settings come from environment variables, `.env`, and `.env.local`, with CLI
-flags taking precedence.
+flags taking precedence. Most users only need an API key.
 
-| Variable | Default |
-| --- | --- |
-| `GEMINI_API_KEY` / `OPENAI_API_KEY` | |
-| `KVA_GEMINI_MODEL` | `gemini-3.5-flash-lite` |
-| `KVA_OPENAI_MODEL` | `gpt-4o-mini` |
-| `KVA_WORK_DIR` | `./work` |
-| `KVA_OUT_DIR` | `./out` |
-| `KVA_SAMPLING_SCENE_THRESHOLD` | `0.35` |
-| `KVA_SAMPLING_HEARTBEAT_SECONDS` | `900` |
-| `KVA_SAMPLING_MIN_GAP_SECONDS` | `45` |
-| `KVA_SAMPLING_PHASH_DISTANCE` | `6` |
-| `KVA_KICK_AUTH_TOKEN` | unset |
-| `KVA_KICK_CHAT_WORKERS` | `8` |
-| `KVA_CHAT_WINDOW_SECONDS` | `45` |
-| `KVA_CHAT_MAX_LINES` | `30` |
-| `KVA_SMOOTHING_MIN_SEGMENT_SECONDS` | `60` |
-| `KVA_SMOOTHING_ALT_TAB_WINDOW_SECONDS` | `90` |
-| `KVA_SMOOTHING_CONFIRM_CONSECUTIVE` | `2` |
-| `KVA_SMOOTHING_MIN_CONFIDENCE` | `0.35` |
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | | Provider credentials |
+| `KVA_GEMINI_MODEL` | `gemini-3.5-flash-lite` | Default Gemini model |
+| `KVA_OPENAI_MODEL` | `gpt-4o-mini` | Default OpenAI model |
+| `KVA_WORK_DIR` | `./work` | Cache and scratch files |
+| `KVA_OUT_DIR` | `./out` | Output files |
+| `KVA_SAMPLING_SCENE_THRESHOLD` | `0.35` | Scene change sensitivity, higher means fewer triggers |
+| `KVA_SAMPLING_HEARTBEAT_SECONDS` | `900` | Seconds between fallback checkpoints |
+| `KVA_SAMPLING_MIN_GAP_SECONDS` | `45` | Minimum spacing between sample points |
+| `KVA_SAMPLING_PHASH_DISTANCE` | `6` | Perceptual hash distance below which grids count as duplicates |
+| `KVA_KICK_AUTH_TOKEN` | unset | Optional bearer token for Kick's chat endpoint |
+| `KVA_KICK_CHAT_WORKERS` | `8` | Parallel chat download threads |
+| `KVA_CHAT_WINDOW_SECONDS` | `45` | Chat seconds either side of a sample point |
+| `KVA_CHAT_MAX_LINES` | `30` | Chat lines sent per sample |
+| `KVA_SMOOTHING_MIN_SEGMENT_SECONDS` | `60` | Shortest segment the timeline will contain |
+| `KVA_SMOOTHING_ALT_TAB_WINDOW_SECONDS` | `90` | Longest interruption absorbed into the surrounding segment |
+| `KVA_SMOOTHING_CONFIRM_CONSECUTIVE` | `2` | Agreeing samples needed to confirm a transition |
+| `KVA_SMOOTHING_MIN_CONFIDENCE` | `0.35` | Verdicts below this carry the previous state forward |
 
 ## REST API and debug UI
 
@@ -510,6 +592,8 @@ print("cost: $%.4f" % report.cost["total_cost_usd"])
 
 ## Categories
 
+Every sample is assigned one of these categories:
+
 | Category | Covers |
 | --- | --- |
 | Gaming | Any game, including menus, queues, and loading screens |
@@ -524,6 +608,39 @@ print("cost: $%.4f" % report.cost["total_cost_usd"])
 Each classification also carries a specific title, a granular sub-activity, an
 on-screen flag, an AFK flag, a confidence score, and a one-sentence justification
 naming the visual markers that drove the decision.
+
+## Temporal smoothing
+
+Raw per-sample verdicts fragment badly: streamers alt-tab, games show loading
+screens, the model occasionally misreads a frame. Smoothing enforces three
+rules.
+
+**A single verdict never confirms a transition.** A state earns its own segment
+by being observed repeatedly: `confirm_consecutive` samples agreeing, or two
+samples spread past `min_segment_seconds`.
+
+**A-B-A sandwiches rejoin A.** A brief desktop click or loading screen between
+two stretches of the same game is absorbed. The absorption is bounded, because
+rewriting 30 seconds is smoothing and rewriting 700 seconds is fabrication.
+
+**The bound scales with the sampling cadence.** At a 900-second heartbeat, the
+gap around a lone verdict is dominated by how often you sampled, not by how long
+the interruption lasted, so anything under half a sampling interval is treated
+as unresolvable. At a 60-second cadence the same gap is well resolved and the
+state is kept.
+
+Low-confidence samples carry the current state forward rather than opening a new
+one: a hesitant verdict is weaker evidence than continuity.
+
+## Rate limits and transient errors
+
+Synchronous classification retries each request on rate-limit and server
+errors (HTTP 408, 429, 5xx, or messages mentioning quota, rate limit, or
+overload). Up to 8 attempts per request. The wait honours the provider's
+`Retry-After` header or Gemini's `retryDelay` hint when present, otherwise it
+backs off exponentially from 2s, capped at 120s. Free-tier quota exhaustion
+pauses the run instead of failing it. Errors that are not transient (bad API
+key, invalid request) are recorded against the sample and the run continues.
 
 ## Tests
 
@@ -554,33 +671,38 @@ touches the network.
 
 ## Troubleshooting
 
-**`kick-vod-analyser: command not found`** — the console script is not on your
-`PATH`. Use `python -m kick_vod_analyser.cli` instead, which always works from
-the project root.
+Each entry starts with the error message you will see.
 
-**`404 NOT_FOUND ... no longer available to new users`** — the model you asked
-for has been retired for new API keys. Pass a current one with `--model`, or
-update `KVA_GEMINI_MODEL` in your `.env.local`. List what your key can reach:
+### `kick-vod-analyser: command not found`
+
+The console script is not on your `PATH`. Use `python -m kick_vod_analyser.cli`
+instead, which always works from the project root.
+
+### `404 NOT_FOUND ... no longer available to new users`
+
+The model you asked for has been retired for new API keys. Pass a current one
+with `--model`, or update `KVA_GEMINI_MODEL` in your `.env.local`. List what
+your key can reach:
 
 ```bash
-python -c "from google import genai; from kick_vod_analyser.config import load_settings; c=genai.Client(api_key=load_settings().gemini_api_key); print('
-'.join(m.name for m in c.models.list() if 'generateContent' in (m.supported_actions or [])))"
+python -c "from google import genai; from kick_vod_analyser.config import load_settings; c=genai.Client(api_key=load_settings().gemini_api_key); print('\n'.join(m.name for m in c.models.list() if 'generateContent' in (m.supported_actions or [])))"
 ```
 
-Note that a value in `.env` or `.env.local` overrides the built-in default, so a
-stale `KVA_GEMINI_MODEL` line will keep pinning a retired model even after an
-upgrade. Check what is actually in effect:
+A value in `.env` or `.env.local` overrides the built-in default, so a stale
+`KVA_GEMINI_MODEL` line will keep pinning a retired model even after an upgrade.
+Check what is actually in effect:
 
 ```bash
 python -c "from kick_vod_analyser.config import load_settings; print(load_settings().gemini_model)"
 ```
 
-**`404 NOT_FOUND` / `Kick video API returned 404` on a VOD that plays fine in a
-browser** — handled automatically, but worth understanding. Kick VOD URLs now
-carry a version 7 UUID that no read endpoint accepts, and that id appears
-nowhere in the API payloads. The resolver decodes the creation timestamp the v7
-id embeds, looks the channel's video listing up, and matches on time to recover
-the version 4 `video.uuid` the endpoints do accept. You will see this in the log:
+### `404 NOT_FOUND` / `Kick video API returned 404` on a VOD that plays in a browser
+
+Handled automatically, but worth understanding. Kick VOD URLs now carry a
+version 7 UUID that no read endpoint accepts, and that id appears nowhere in the
+API payloads. The resolver decodes the creation timestamp the v7 id embeds,
+looks the channel's video listing up, and matches on time to recover the version
+4 `video.uuid` the endpoints do accept. You will see this in the log:
 
 ```
 mapped URL id to video uuid 1e7fa39e-09ad-47c5-9f25-f08eedafa16d (4.0s apart)
@@ -593,25 +715,32 @@ use `kick.com/<channel>/videos/<id>`.
 Because the mapping resolves to the canonical video id, `out/<vod_id>/` is named
 after the v4 id, not the id in the URL you pasted.
 
-**`GEMINI_API_KEY is not set`** — create `.env.local` in the project root with
-`GEMINI_API_KEY=your-key-here`, or export it in your shell.
+### `GEMINI_API_KEY is not set`
 
-**Every Kick request returns 403** — `curl_cffi` is missing. Install the extra:
+Create `.env.local` in the project root with `GEMINI_API_KEY=your-key-here`, or
+export it in your shell.
+
+### Every Kick request returns 403
+
+`curl_cffi` is missing. Install the extra:
 
 ```bash
 pip install -e ".[kick]"
 ```
 
-**`required binaries not found on PATH: ffmpeg`** — install ffmpeg and make sure
-both `ffmpeg` and `ffprobe` resolve.
+### `required binaries not found on PATH: ffmpeg`
 
-**`UnicodeEncodeError` when printing a stream title** — Windows console encoding.
-Prefix the command with `PYTHONIOENCODING=utf-8`.
+Install ffmpeg and make sure both `ffmpeg` and `ffprobe` resolve.
 
-**A run finishes with an empty timeline and N non-fatal issues** — every
-classification failed. The listed errors carry the reason; the model id and the
-API key are the usual causes. Nothing is cached on failure, so fixing the cause
-and re-running only repeats the classification step.
+### `UnicodeEncodeError` when printing a stream title
+
+Windows console encoding. Prefix the command with `PYTHONIOENCODING=utf-8`.
+
+### A run finishes with an empty timeline and N non-fatal issues
+
+Every classification failed. The listed errors carry the reason; the model id
+and the API key are the usual causes. Nothing is cached on failure, so fixing
+the cause and re-running only repeats the classification step.
 
 ## Project layout
 
@@ -664,3 +793,22 @@ src/kick_vod_analyser/
   once per VOD. Frame extraction is unaffected: input seeking fetches only the
   segments around each sample point, measured at 4.2 seconds per point
   regardless of position in the VOD.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| VOD | Video on demand. A recording of a past live stream |
+| Sample / sample point | A moment in the VOD at which screenshots are taken and classified |
+| Scene detection | Scanning the video for moments where the picture changes sharply |
+| Heartbeat | A fallback sample taken at a fixed interval when nothing has changed |
+| Burst / grid | Four screenshots around a sample point, tiled into one 2x2 image |
+| Rendition | One of the quality levels (160p, 720p, ...) a VOD is available in |
+| Keyframe | A fully encoded video frame, roughly every two to four seconds. Frames between keyframes only store differences |
+| Provider | The AI service that classifies screenshots: Gemini, OpenAI, or the built-in mock |
+| Batch mode | Sending all classification requests at once for half price, with results up to 24 hours later |
+| Segment | A stretch of the timeline with one activity, built from consecutive agreeing samples |
+| Smoothing | Merging samples into segments while ignoring brief interruptions like alt-tabs |
+| Token | The unit AI providers bill by. Roughly a word of text or a patch of an image |
+| Confidence | The model's own 0 to 1 estimate of how sure it is about a verdict |
+| AFK | Away from keyboard. The streamer is not at the desk |
