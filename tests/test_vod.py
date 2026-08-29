@@ -14,7 +14,7 @@ from kick_vod_analyser.ingest.vod import (
     resolve_vod,
 )
 
-UUID = "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
+UUID = "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d"
 
 
 class TestParseVodUrl:
@@ -93,8 +93,10 @@ class FakeClient:
     def __init__(self, response):
         self.response = response
         self.closed = False
+        self.urls = []
 
     def get(self, url, **kwargs):
+        self.urls.append(url)
         return self.response
 
     def close(self):
@@ -113,6 +115,170 @@ VIDEO_PAYLOAD = {
 }
 
 
+UUID7 = "01a039e2-ec00-71a0-8ebf-4d986fe440d0"
+UUID7_EPOCH = 1_787_677_568.0
+VIDEO_UUID = "1e7fa39e-09ad-47c5-9f25-f08eedafa16d"
+
+CHANNEL_LISTING = [
+    {"created_at": "2026-08-27 18:30:58", "video": {"uuid": "3e6a9d94-b3d8-45f9-bcf7-0d6c291b2da3"}},
+    {"created_at": "2026-08-25 17:06:12", "video": {"uuid": VIDEO_UUID}},
+    {"created_at": "2026-08-24 16:32:46", "video": {"uuid": "84e0dcbf-97b5-4e39-9535-54a07f062547"}},
+]
+
+
+class TestUuidHelpers:
+    def test_detects_the_url_only_version(self):
+        assert vod_module.uuid_version(UUID7) == 7
+        assert vod_module.uuid_version(UUID) == 4
+
+    @pytest.mark.parametrize("value", ["", "not-a-uuid", None, 12345])
+    def test_a_non_uuid_has_no_version(self, value):
+        assert vod_module.uuid_version(value) is None
+
+    def test_decodes_the_embedded_timestamp(self):
+        assert vod_module.uuid7_epoch(UUID7) == pytest.approx(UUID7_EPOCH, abs=1.0)
+
+    def test_a_version_4_id_carries_no_timestamp(self):
+        assert vod_module.uuid7_epoch(UUID) is None
+
+
+class TestHostValidation:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://kick.com/xqc/videos/{UUID}",
+            f"http://kick.com/video/{UUID}",
+            f"https://www.kick.com/xqc/videos/{UUID}",
+            f"kick.com/xqc/videos/{UUID}",
+        ],
+    )
+    def test_accepts_kick_hosts(self, url):
+        assert vod_module.is_kick_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://example.com/videos/{UUID}",
+            f"https://kick.com.evil.test/videos/{UUID}",
+            f"https://notkick.com/xqc/videos/{UUID}",
+            "",
+        ],
+    )
+    def test_rejects_everything_else(self, url):
+        assert not vod_module.is_kick_url(url)
+
+    def test_a_non_kick_url_is_reported_as_such(self):
+        with pytest.raises(VodResolutionError, match="not a Kick URL"):
+            vod_module.resolve_vod(f"https://example.com/videos/{UUID7}")
+
+
+class TestFindVideoUuidByTime:
+    def _client(self):
+        return FakeClient(FakeResponse(CHANNEL_LISTING))
+
+    def test_matches_the_closest_listing_entry(self):
+        found = vod_module.find_video_uuid_by_time(
+            "nickwhite", UUID7_EPOCH, client=self._client()
+        )
+        assert found == VIDEO_UUID
+
+    def test_queries_the_channel_listing_endpoint(self):
+        client = self._client()
+        vod_module.find_video_uuid_by_time("nickwhite", UUID7_EPOCH, client=client)
+        assert "channels/nickwhite/videos" in client.urls[0]
+
+    def test_a_caller_supplied_client_is_left_open(self):
+        client = self._client()
+        vod_module.find_video_uuid_by_time("nickwhite", UUID7_EPOCH, client=client)
+        assert not client.closed
+
+    def test_a_timestamp_outside_the_tolerance_does_not_match(self):
+        assert (
+            vod_module.find_video_uuid_by_time(
+                "nickwhite", UUID7_EPOCH + 86_400, client=self._client()
+            )
+            is None
+        )
+
+    def test_the_tolerance_is_configurable(self):
+        found = vod_module.find_video_uuid_by_time(
+            "nickwhite", UUID7_EPOCH + 3600, tolerance=7200.0, client=self._client()
+        )
+        assert found == VIDEO_UUID
+
+    def test_a_failed_listing_returns_none(self):
+        client = FakeClient(FakeResponse({}, status_code=403))
+        assert vod_module.find_video_uuid_by_time("x", UUID7_EPOCH, client=client) is None
+
+    def test_an_empty_listing_returns_none(self):
+        client = FakeClient(FakeResponse([]))
+        assert vod_module.find_video_uuid_by_time("x", UUID7_EPOCH, client=client) is None
+
+    def test_rows_without_a_uuid_are_skipped(self):
+        client = FakeClient(FakeResponse([{"created_at": "2026-08-25 17:06:12"}]))
+        assert vod_module.find_video_uuid_by_time("x", UUID7_EPOCH, client=client) is None
+
+    def test_a_transport_error_returns_none(self):
+        class Boom:
+            closed = False
+
+            def get(self, url, **kwargs):
+                raise ConnectionError("network down")
+
+            def close(self):
+                self.closed = True
+
+        assert vod_module.find_video_uuid_by_time("x", UUID7_EPOCH, client=Boom()) is None
+
+
+class TestResolveVideoUuid:
+    def test_a_version_4_id_passes_through_without_a_request(self):
+        client = FakeClient(FakeResponse(CHANNEL_LISTING))
+        assert (
+            vod_module.resolve_video_uuid(f"https://kick.com/xqc/videos/{UUID}", client=client)
+            == UUID
+        )
+        assert client.urls == []
+
+    def test_a_url_only_id_is_mapped_through_the_channel(self):
+        client = FakeClient(FakeResponse(CHANNEL_LISTING))
+        resolved = vod_module.resolve_video_uuid(
+            f"https://kick.com/nickwhite/videos/{UUID7}", client=client
+        )
+        assert resolved == VIDEO_UUID
+
+    def test_a_url_only_id_without_a_channel_is_rejected(self):
+        with pytest.raises(VodResolutionError, match="URL-only video id"):
+            vod_module.resolve_video_uuid(f"https://kick.com/video/{UUID7}")
+
+    def test_an_unmatchable_id_names_the_channel(self):
+        client = FakeClient(FakeResponse([]))
+        with pytest.raises(VodResolutionError, match="could not map URL id"):
+            vod_module.resolve_video_uuid(
+                f"https://kick.com/nickwhite/videos/{UUID7}", client=client
+            )
+
+    def test_a_url_without_any_id_is_rejected(self):
+        with pytest.raises(VodResolutionError, match="no video id"):
+            vod_module.resolve_video_uuid("https://kick.com/nickwhite")
+
+
+class TestCanonicalVodUrl:
+    def test_a_version_4_url_is_unchanged(self, monkeypatch):
+        url = f"https://kick.com/xqc/videos/{UUID}"
+        assert vod_module.canonical_vod_url(url) == url
+
+    def test_a_url_only_id_is_rewritten_for_the_fallback(self, monkeypatch):
+        monkeypatch.setattr(
+            vod_module, "resolve_video_uuid", lambda url, timeout=30.0: VIDEO_UUID
+        )
+        rewritten = vod_module.canonical_vod_url(f"https://kick.com/nickwhite/videos/{UUID7}")
+        assert rewritten == f"https://kick.com/nickwhite/videos/{VIDEO_UUID}"
+
+    def test_a_url_without_an_id_is_unchanged(self):
+        assert vod_module.canonical_vod_url("https://kick.com/xqc") == "https://kick.com/xqc"
+
+
 class TestResolveViaApi:
     def test_maps_the_kick_payload_onto_vod_info(self, monkeypatch):
         client = FakeClient(FakeResponse(VIDEO_PAYLOAD))
@@ -129,7 +295,7 @@ class TestResolveViaApi:
         assert client.closed
 
     def test_a_url_without_a_uuid_is_rejected(self):
-        with pytest.raises(VodResolutionError, match="no video UUID"):
+        with pytest.raises(VodResolutionError, match="no video id"):
             vod_module.resolve_via_api("https://kick.com/xqc")
 
     def test_a_cloudflare_block_raises(self, monkeypatch):
@@ -172,16 +338,17 @@ class TestResolveViaApi:
         assert calls == []
 
 
-class TestProbeDuration:
-    def test_an_unreadable_source_returns_zero_rather_than_raising(self, tmp_path):
-        assert vod_module.probe_duration(str(tmp_path / "absent.m3u8")) == 0.0
-
     def test_the_slug_in_the_url_wins_over_the_payload(self, monkeypatch):
         monkeypatch.setattr(
             vod_module, "build_client", lambda timeout: FakeClient(FakeResponse(VIDEO_PAYLOAD))
         )
         info = vod_module.resolve_via_api(f"https://kick.com/othername/videos/{UUID}")
         assert info.channel_slug == "othername"
+
+
+class TestProbeDuration:
+    def test_an_unreadable_source_returns_zero_rather_than_raising(self, tmp_path):
+        assert vod_module.probe_duration(str(tmp_path / "absent.m3u8")) == 0.0
 
 
 class TestResolveVod:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from kick_vod_analyser.ingest.chat import (
+    HISTORY_API,
     ChatIndex,
     JsonlChatSource,
     KickReplayChatSource,
@@ -13,8 +15,9 @@ from kick_vod_analyser.ingest.chat import (
     extract_emotes,
     load_records,
     normalise_record,
+    plan_chunks,
 )
-from kick_vod_analyser.models import ChatMessage
+from kick_vod_analyser.models import ChatMessage, VodInfo
 
 EPOCH = 1_700_000_000.0
 
@@ -198,107 +201,195 @@ class FakeClient:
         self.closed = True
 
 
+class HistoryClient:
+    """Simulates web.kick.com chat history: 25 messages before `cursor`, newest first."""
+
+    PAGE = 25
+
+    def __init__(self, records, *, fail_status=None, fail_on_call=None, explode_on_call=None):
+        self.records = sorted(records, key=lambda r: r["_epoch"], reverse=True)
+        self.calls = []
+        self.closed = False
+        self.fail_status = fail_status
+        self.fail_on_call = fail_on_call
+        self.explode_on_call = explode_on_call
+
+    def get(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        n = len(self.calls)
+        if self.explode_on_call == n:
+            raise ConnectionError("network down")
+        if self.fail_status and (self.fail_on_call is None or self.fail_on_call == n):
+            return FakeResponse({"data": {}, "message": "Invalid request"}, self.fail_status)
+        cursor = int(kwargs["params"]["cursor"]) / 1_000_000
+        page = [r for r in self.records if r["_epoch"] < cursor][: self.PAGE]
+        clean = [{k: v for k, v in r.items() if k != "_epoch"} for r in page]
+        next_cursor = str(int(page[-1]["_epoch"] * 1_000_000)) if page else None
+        return FakeResponse({"data": {"messages": clean, "cursor": next_cursor}})
+
+    def close(self):
+        self.closed = True
+
+
+def kick_record(index, epoch, content="hello"):
+    stamp = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "id": f"m{index}",
+        "chat_id": 42,
+        "content": content,
+        "type": "message",
+        "sender": {"id": index, "username": f"user{index}"},
+        "created_at": stamp,
+        "_epoch": float(epoch),
+    }
+
+
+def install(monkeypatch, client):
+    from kick_vod_analyser.ingest import chat as chat_module
+
+    monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+
+
+class TestPlanChunks:
+    def test_covers_the_window_exactly(self):
+        chunks = plan_chunks(0.0, 1500.0, 600.0)
+        assert chunks == [(0.0, 600.0), (600.0, 1200.0), (1200.0, 1500.0)]
+
+    def test_empty_window_has_no_chunks(self):
+        assert plan_chunks(10.0, 10.0, 600.0) == []
+
+
 class TestKickReplayChatSource:
-    def _page(self, records):
-        return FakeResponse({"data": {"messages": records}})
+    def source(self, **kwargs):
+        kwargs.setdefault("workers", 3)
+        kwargs.setdefault("chunk_seconds", 600.0)
+        kwargs.setdefault("retry_sleep", lambda s: None)
+        return KickReplayChatSource(**kwargs)
 
-    def test_walks_forward_and_collects_messages(self, monkeypatch, vod):
-        from kick_vod_analyser.ingest import chat as chat_module
+    def test_collects_every_message_across_chunks_in_order(self, monkeypatch, vod):
+        records = [kick_record(i, EPOCH + i * 7, f"line {i}") for i in range(500)]
+        client = HistoryClient(records)
+        install(monkeypatch, client)
 
-        pages = [
-            self._page(
-                [
-                    {"id": "1", "content": "a", "timestamp": EPOCH + 10, "username": "v1"},
-                    {"id": "2", "content": "b", "timestamp": EPOCH + 20, "username": "v2"},
-                ]
-            ),
-            self._page([{"id": "3", "content": "c", "timestamp": EPOCH + 90, "username": "v3"}]),
+        index = self.source().fetch(vod)
+
+        assert len(index) == 500
+        assert [m.offset_seconds for m in index.messages] == [i * 7.0 for i in range(500)]
+        assert index.messages[3].username == "user3"
+        assert client.closed
+
+    def test_bursts_larger_than_a_page_are_not_truncated(self, monkeypatch, vod):
+        records = [kick_record(i, EPOCH + 100 + i * 0.01) for i in range(80)]
+        install(monkeypatch, HistoryClient(records))
+
+        assert len(self.source().fetch(vod)) == 80
+
+    def test_messages_outside_the_vod_window_are_dropped(self, monkeypatch, vod):
+        records = [
+            kick_record(1, EPOCH - 60, "before"),
+            kick_record(2, EPOCH + 30, "inside"),
+            kick_record(3, EPOCH + vod.duration_seconds + 60, "after"),
         ]
-        client = FakeClient(pages)
-        monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+        install(monkeypatch, HistoryClient(records))
 
-        index = KickReplayChatSource(max_empty_pages=2).fetch(vod)
+        assert [m.text for m in self.source().fetch(vod).messages] == ["inside"]
 
-        assert [m.text for m in index.messages] == ["a", "b", "c"]
+    def test_request_count_scales_with_messages_not_duration(self, monkeypatch, vod):
+        client = HistoryClient([kick_record(1, EPOCH + 5)])
+        install(monkeypatch, client)
+
+        self.source(chunk_seconds=600.0).fetch(vod)
+
+        assert len(client.calls) == 7
+
+    def test_requests_use_the_cursor_form_and_web_platform_header(self, monkeypatch, vod):
+        client = HistoryClient([])
+        install(monkeypatch, client)
+
+        self.source().fetch(vod)
+
+        call = client.calls[0]
+        assert call["url"] == HISTORY_API.format(chat_id=42)
+        assert set(call["params"]) == {"cursor"}
+        assert call["headers"]["x-app-platform"] == "web"
+        assert "Authorization" not in call["headers"]
+
+    def test_auth_token_is_sent_as_bearer_when_configured(self, monkeypatch, vod):
+        client = HistoryClient([])
+        install(monkeypatch, client)
+
+        self.source(auth_token="abc").fetch(vod)
+
+        assert client.calls[0]["headers"]["Authorization"] == "Bearer abc"
+
+    def test_a_400_stops_the_walk_without_raising(self, monkeypatch, vod):
+        client = HistoryClient([kick_record(1, EPOCH + 5)], fail_status=400)
+        install(monkeypatch, client)
+
+        assert len(self.source().fetch(vod)) == 0
         assert client.closed
 
-    def test_duplicate_ids_are_not_counted_twice(self, monkeypatch, vod):
-        from kick_vod_analyser.ingest import chat as chat_module
+    def test_transient_errors_are_retried(self, monkeypatch, vod):
+        client = HistoryClient([kick_record(1, EPOCH + 5)], fail_status=429, fail_on_call=1)
+        install(monkeypatch, client)
 
-        record = {"id": "1", "content": "a", "timestamp": EPOCH + 10, "username": "v1"}
-        client = FakeClient([self._page([record]), self._page([record])])
-        monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+        assert len(self.source(workers=1).fetch(vod)) == 1
 
-        assert len(KickReplayChatSource(max_empty_pages=1).fetch(vod)) == 1
+    def test_a_failing_chunk_keeps_the_others(self, monkeypatch, vod):
+        records = [kick_record(1, EPOCH + 5, "first"), kick_record(2, EPOCH + 3000, "last")]
+        client = HistoryClient(records, explode_on_call=1)
+        install(monkeypatch, client)
 
-    def test_messages_past_the_vod_end_are_discarded(self, monkeypatch, vod):
-        from kick_vod_analyser.ingest import chat as chat_module
+        index = self.source(workers=1).fetch(vod)
 
-        client = FakeClient(
-            [
-                self._page(
-                    [
-                        {"id": "1", "content": "in", "timestamp": EPOCH + 10, "username": "v"},
-                        {"id": "2", "content": "out", "timestamp": EPOCH + 99999, "username": "v"},
-                    ]
-                )
-            ]
-        )
-        monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+        assert [m.text for m in index.messages] == ["last"]
 
-        index = KickReplayChatSource(max_empty_pages=1).fetch(vod)
-        assert [m.text for m in index.messages] == ["in"]
+    def test_duplicates_on_chunk_boundaries_collapse(self, monkeypatch, vod):
+        records = [kick_record(1, EPOCH + 600, "edge")]
+        install(monkeypatch, HistoryClient(records))
 
-    def test_a_non_200_response_stops_the_walk_without_raising(self, monkeypatch, vod):
-        from kick_vod_analyser.ingest import chat as chat_module
+        assert len(self.source().fetch(vod)) == 1
 
-        client = FakeClient([FakeResponse({}, status_code=403)])
-        monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+    def test_download_returns_raw_kick_records(self, monkeypatch, vod):
+        install(monkeypatch, HistoryClient([kick_record(7, EPOCH + 9, "raw")]))
 
-        assert len(KickReplayChatSource().fetch(vod)) == 0
+        raw = self.source().download(vod)
 
-    def test_a_transport_error_returns_what_was_collected(self, monkeypatch, vod):
-        from kick_vod_analyser.ingest import chat as chat_module
+        assert raw[0]["id"] == "m7"
+        assert raw[0]["sender"]["username"] == "user7"
+        assert "_epoch" not in raw[0]
 
-        class ExplodingClient(FakeClient):
-            def get(self, url, **kwargs):
-                if self.calls:
-                    raise ConnectionError("network down")
-                self.calls.append(kwargs)
-                return FakeResponse(
-                    {
-                        "data": {
-                            "messages": [
-                                {"id": "1", "content": "a", "timestamp": EPOCH + 5, "username": "v"}
-                            ]
-                        }
-                    }
-                )
+    def test_inline_emote_tokens_are_parsed(self, monkeypatch, vod):
+        install(monkeypatch, HistoryClient([kick_record(1, EPOCH + 1, "[emote:37233:PogU] wow")]))
 
-        client = ExplodingClient([])
-        monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+        message = self.source().fetch(vod).messages[0]
 
-        assert len(KickReplayChatSource().fetch(vod)) == 1
-        assert client.closed
+        assert message.text == "PogU wow"
+        assert message.emotes == ("PogU",)
 
-    def test_empty_pages_advance_the_cursor(self, monkeypatch, vod):
-        from kick_vod_analyser.ingest import chat as chat_module
+    def test_missing_channel_id_skips_without_requests(self, monkeypatch, vod):
+        client = HistoryClient([])
+        install(monkeypatch, client)
+        no_channel = vod.model_copy(update={"channel_id": None})
 
-        client = FakeClient([])
-        monkeypatch.setattr(chat_module, "build_client", lambda timeout: client)
+        assert len(self.source().fetch(no_channel)) == 0
+        assert client.calls == []
 
-        KickReplayChatSource(page_step_seconds=600.0, max_empty_pages=3).fetch(vod)
+    def test_missing_start_time_skips_without_requests(self, monkeypatch, vod):
+        client = HistoryClient([])
+        install(monkeypatch, client)
+        no_start = vod.model_copy(update={"started_at_epoch": None})
 
-        cursors = [call["start_time"] for call in client.calls]
-        assert cursors == sorted(cursors) and len(set(cursors)) == len(cursors)
+        assert len(self.source().fetch(no_start)) == 0
+        assert client.calls == []
 
-    def test_missing_channel_id_skips_the_walk(self, vod):
-        stripped = vod.model_copy(update={"channel_id": None})
-        assert len(KickReplayChatSource().fetch(stripped)) == 0
+    def test_page_limit_is_honoured(self, monkeypatch, vod):
+        records = [kick_record(i, EPOCH + 1 + i * 0.001) for i in range(100)]
+        install(monkeypatch, HistoryClient(records))
 
-    def test_missing_start_time_skips_the_walk(self, vod):
-        stripped = vod.model_copy(update={"started_at_epoch": None})
-        assert len(KickReplayChatSource().fetch(stripped)) == 0
+        assert len(self.source(max_pages_per_chunk=2).fetch(vod)) == 50
+
+
 
 
 class TestBuildChatSource:
@@ -318,3 +409,9 @@ class TestBuildChatSource:
 
     def test_the_null_source_yields_an_empty_index(self, vod):
         assert len(NullChatSource().fetch(vod)) == 0
+
+    def test_kick_passes_token_and_workers(self):
+        source = build_chat_source("kick", auth_token="t", workers=3)
+        assert isinstance(source, KickReplayChatSource)
+        assert source.auth_token == "t"
+        assert source.workers == 3

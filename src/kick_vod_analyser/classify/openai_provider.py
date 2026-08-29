@@ -14,6 +14,7 @@ from .base import (
     ClassificationResponse,
     parse_classification,
 )
+from .retry import call_with_retry
 from .prompts import SYSTEM_PROMPT, openai_response_format
 
 log = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class OpenAIClassifier(Classifier):
 
     provider = "openai"
 
-    def __init__(self, model: str, api_key: str | None = None, *, max_workers: int = 8) -> None:
+    def __init__(self, model: str, api_key: str | None = None, *, max_workers: int = 8, max_attempts: int = 8) -> None:
         super().__init__(model)
         try:
             from openai import OpenAI
@@ -39,6 +40,7 @@ class OpenAIClassifier(Classifier):
 
         self._client = OpenAI(api_key=api_key) if api_key else OpenAI()
         self.max_workers = max_workers
+        self.max_attempts = max_attempts
 
     def _messages(self, request: ClassificationRequest) -> list[dict]:
         data_uri = f"data:{request.mime_type};base64,{encode_base64(request.image_path)}"
@@ -61,12 +63,17 @@ class OpenAIClassifier(Classifier):
 
     def _classify_one(self, request: ClassificationRequest) -> ClassificationResponse:
         try:
-            completion = self._client.chat.completions.create(
-                model=self.model,
-                messages=self._messages(request),
-                response_format=openai_response_format(),
-                temperature=0.1,
-                max_tokens=400,
+            messages = self._messages(request)
+            completion = call_with_retry(
+                lambda: self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format=openai_response_format(),
+                    temperature=0.1,
+                    max_tokens=400,
+                ),
+                label=f"openai request {request.custom_id}",
+                attempts=self.max_attempts,
             )
         except Exception as exc:
             log.warning("openai request %s failed: %s", request.custom_id, exc)

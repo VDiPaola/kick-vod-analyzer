@@ -13,6 +13,7 @@ from .base import (
     ClassificationResponse,
     parse_classification,
 )
+from .retry import call_with_retry
 from .prompts import SYSTEM_PROMPT, gemini_response_schema
 
 log = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ class GeminiClassifier(Classifier):
 
     provider = "gemini"
 
-    def __init__(self, model: str, api_key: str | None = None, *, max_workers: int = 8) -> None:
+    def __init__(self, model: str, api_key: str | None = None, *, max_workers: int = 8, max_attempts: int = 8) -> None:
         super().__init__(model)
         try:
             from google import genai
@@ -49,6 +50,7 @@ class GeminiClassifier(Classifier):
         self._types = types
         self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
         self.max_workers = max_workers
+        self.max_attempts = max_attempts
 
     def _generation_config(self):
         return self._types.GenerateContentConfig(
@@ -66,15 +68,18 @@ class GeminiClassifier(Classifier):
 
     def _classify_one(self, request: ClassificationRequest) -> ClassificationResponse:
         try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=[
-                    self._types.Part.from_bytes(
-                        data=request.image_path.read_bytes(), mime_type=request.mime_type
-                    ),
-                    self._types.Part.from_text(text=request.user_prompt),
-                ],
-                config=self._generation_config(),
+            contents = [
+                self._types.Part.from_bytes(
+                    data=request.image_path.read_bytes(), mime_type=request.mime_type
+                ),
+                self._types.Part.from_text(text=request.user_prompt),
+            ]
+            response = call_with_retry(
+                lambda: self._client.models.generate_content(
+                    model=self.model, contents=contents, config=self._generation_config()
+                ),
+                label=f"gemini request {request.custom_id}",
+                attempts=self.max_attempts,
             )
         except Exception as exc:
             log.warning("gemini request %s failed: %s", request.custom_id, exc)

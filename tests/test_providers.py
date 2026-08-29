@@ -119,13 +119,13 @@ class TestGeminiSync:
 
         def responder(kwargs):
             if "offset 1" in kwargs["contents"][1].text:
-                raise RuntimeError("rate limited")
+                raise RuntimeError("malformed request")
             return Response()
 
         responses = self._classifier(monkeypatch, responder).classify(requests)
 
         assert responses[1].classification is None
-        assert "rate limited" in responses[1].error
+        assert "malformed request" in responses[1].error
         assert responses[0].classification is not None
         assert responses[2].classification is not None
 

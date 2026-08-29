@@ -1,8 +1,8 @@
 """Chat replay ingestion.
 
 Kick exposes no documented VOD chat history API. The replay the web player
-renders is served by an undocumented, Cloudflare-fronted endpoint that can
-change without notice, so chat is treated as optional enrichment: every source
+renders comes from an undocumented, Cloudflare-fronted endpoint that can change
+without notice, so chat is treated as optional enrichment: every source
 degrades to an empty index rather than failing the run.
 """
 
@@ -11,16 +11,23 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import re
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from ..classify.retry import call_with_retry
 from ..models import ChatMessage, VodInfo
 from .http import build_client
+from .vod import parse_epoch
 
 log = logging.getLogger(__name__)
 
-MESSAGES_API = "https://kick.com/api/v2/channels/{channel_id}/messages"
+HISTORY_API = "https://web.kick.com/api/v1/chat/{chat_id}/history"
+INLINE_EMOTE = re.compile(r"\[emote:(\d+):([^\]]+)\]")
 
 
 class ChatIndex:
@@ -104,12 +111,25 @@ class JsonlChatSource(ChatSource):
         return ChatIndex(messages)
 
 
-class KickReplayChatSource(ChatSource):
-    """Walk the undocumented Kick replay endpoint forward through the VOD.
+class KickChatError(Exception):
+    """A non-200 reply from the chat history endpoint."""
 
-    The endpoint returns a page of messages at or after start_time. Paging
-    advances by the newest message seen, with a fixed step forward when a page
-    comes back empty so quiet stretches do not stall the walk.
+    def __init__(self, status_code: int, body: str = "") -> None:
+        super().__init__(f"Kick chat history returned {status_code}: {body[:120]}")
+        self.status_code = status_code
+
+
+class KickReplayChatSource(ChatSource):
+    """Download VOD chat from Kick's chat history endpoint.
+
+    `web.kick.com/api/v1/chat/{chat_id}/history?cursor=<epoch_micros>` returns
+    the 25 messages sent before the cursor, newest first, plus the cursor for
+    the next older page. No login is needed. The VOD is split into time chunks
+    and each chunk is walked backwards from its end on its own thread, so the
+    request count scales with message volume and quiet stretches cost nothing.
+
+    The endpoint's `start_time` form is not used: it returns a fixed five second
+    bucket truncated to its earliest 25 messages, which drops chat in busy moments.
     """
 
     name = "kick"
@@ -118,80 +138,141 @@ class KickReplayChatSource(ChatSource):
         self,
         *,
         timeout: float = 30.0,
-        page_step_seconds: float = 60.0,
-        max_pages: int = 5000,
-        max_empty_pages: int = 40,
+        chunk_seconds: float = 600.0,
+        workers: int = 8,
+        max_pages_per_chunk: int = 4000,
+        auth_token: str | None = None,
+        retry_attempts: int = 5,
+        retry_sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.timeout = timeout
-        self.page_step_seconds = page_step_seconds
-        self.max_pages = max_pages
-        self.max_empty_pages = max_empty_pages
+        self.chunk_seconds = max(1.0, chunk_seconds)
+        self.workers = max(1, workers)
+        self.max_pages_per_chunk = max_pages_per_chunk
+        self.auth_token = auth_token
+        self.retry_attempts = retry_attempts
+        self.retry_sleep = retry_sleep
 
     def fetch(self, vod: VodInfo) -> ChatIndex:
-        if not vod.channel_id:
-            log.warning("no channel id resolved; skipping Kick chat replay")
-            return ChatIndex()
-        if not vod.started_at_epoch:
-            log.warning("no VOD start time resolved; skipping Kick chat replay")
-            return ChatIndex()
-
-        url = MESSAGES_API.format(channel_id=vod.channel_id)
-        client = build_client(self.timeout)
-        seen: set[str] = set()
-        messages: list[ChatMessage] = []
-        cursor = vod.started_at_epoch
-        end = vod.started_at_epoch + vod.duration_seconds
-        empty_pages = 0
-
-        try:
-            for _ in range(self.max_pages):
-                if cursor >= end or empty_pages >= self.max_empty_pages:
-                    break
-                page = self.request_page(client, url, cursor)
-                if page is None:
-                    break
-                fresh = 0
-                newest = cursor
-                for record in page:
-                    identifier = str(record.get("id") or record.get("uuid") or "")
-                    if identifier and identifier in seen:
-                        continue
-                    if identifier:
-                        seen.add(identifier)
-                    message = normalise_record(record, vod.started_at_epoch)
-                    if message is None or message.offset_seconds > vod.duration_seconds:
-                        continue
-                    messages.append(message)
-                    newest = max(newest, vod.started_at_epoch + message.offset_seconds)
-                    fresh += 1
-                if fresh == 0:
-                    empty_pages += 1
-                    cursor += self.page_step_seconds
-                else:
-                    empty_pages = 0
-                    cursor = max(newest + 0.001, cursor + 1.0)
-        except Exception as exc:
-            log.warning("Kick chat replay aborted after %d messages: %s", len(messages), exc)
-        finally:
-            client.close()
-
+        records = self.download(vod)
+        messages = [
+            m
+            for m in (normalise_record(r, vod.started_at_epoch) for r in records)
+            if m is not None and m.offset_seconds <= vod.duration_seconds
+        ]
         log.info("collected %d chat messages for %s", len(messages), vod.vod_id)
         return ChatIndex(messages)
 
-    def request_page(self, client: Any, url: str, cursor: float) -> list[dict[str, Any]] | None:
-        response = client.get(url, params={"start_time": int(cursor)})
-        if response.status_code != 200:
-            log.warning("Kick chat replay returned %s; stopping", response.status_code)
-            return None
-        payload = response.json()
-        if isinstance(payload, dict):
-            data = payload.get("data")
-            if isinstance(data, dict):
-                return list(data.get("messages") or [])
-            if isinstance(data, list):
-                return data
-            return list(payload.get("messages") or [])
-        return list(payload or [])
+    def download(self, vod: VodInfo) -> list[dict[str, Any]]:
+        """Return the raw Kick records for the VOD window, oldest first, deduplicated."""
+        if not vod.channel_id:
+            log.warning("no channel id resolved; skipping Kick chat replay")
+            return []
+        if not vod.started_at_epoch:
+            log.warning("no VOD start time resolved; skipping Kick chat replay")
+            return []
+
+        url = HISTORY_API.format(chat_id=vod.channel_id)
+        chunks = plan_chunks(
+            vod.started_at_epoch, vod.started_at_epoch + vod.duration_seconds, self.chunk_seconds
+        )
+        client = build_client(self.timeout)
+        collected: dict[str, dict[str, Any]] = {}
+        try:
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                for chunk_records in pool.map(lambda c: self.walk_chunk(client, url, *c), chunks):
+                    for record in chunk_records:
+                        collected.setdefault(record_id(record), record)
+        finally:
+            client.close()
+
+        return sorted(collected.values(), key=lambda r: parse_epoch(r.get("created_at")) or 0.0)
+
+    def walk_chunk(
+        self, client: Any, url: str, start_epoch: float, end_epoch: float
+    ) -> list[dict[str, Any]]:
+        """Page backwards from end_epoch until a message older than start_epoch appears."""
+        cursor = str(int(end_epoch * 1_000_000))
+        records: list[dict[str, Any]] = []
+        try:
+            for _ in range(self.max_pages_per_chunk):
+                page, next_cursor = self.request_page(client, url, cursor)
+                if not page:
+                    break
+                oldest = end_epoch
+                for record in page:
+                    sent_at = parse_epoch(record.get("created_at"))
+                    if sent_at is None:
+                        continue
+                    oldest = min(oldest, sent_at)
+                    if start_epoch <= sent_at < end_epoch:
+                        records.append(record)
+                if oldest < start_epoch or not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+            else:
+                log.warning(
+                    "chat chunk starting at %s hit the %d page limit; chat may be incomplete",
+                    start_epoch,
+                    self.max_pages_per_chunk,
+                )
+        except Exception as exc:
+            log.warning(
+                "chat chunk %s..%s aborted after %d messages: %s",
+                start_epoch,
+                end_epoch,
+                len(records),
+                exc,
+            )
+        return records
+
+    def request_page(
+        self, client: Any, url: str, cursor: str
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        headers = {"x-app-platform": "web"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+
+        def once() -> Any:
+            response = client.get(url, params={"cursor": cursor}, headers=headers)
+            if response.status_code != 200:
+                raise KickChatError(response.status_code, response.text)
+            return response.json()
+
+        payload = call_with_retry(
+            once,
+            label="Kick chat history",
+            attempts=self.retry_attempts,
+            base_delay=1.0,
+            max_delay=30.0,
+            sleep=self.retry_sleep,
+        )
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return [], None
+        messages = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        next_cursor = data.get("cursor")
+        return messages, str(next_cursor) if next_cursor else None
+
+
+def plan_chunks(
+    start_epoch: float, end_epoch: float, chunk_seconds: float
+) -> list[tuple[float, float]]:
+    """Split [start, end) into consecutive windows of at most chunk_seconds."""
+    chunks: list[tuple[float, float]] = []
+    cursor = start_epoch
+    while cursor < end_epoch:
+        chunk_end = min(cursor + chunk_seconds, end_epoch)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end
+    return chunks
+
+
+def record_id(record: dict[str, Any]) -> str:
+    identifier = record.get("id") or record.get("uuid")
+    if identifier:
+        return str(identifier)
+    return json.dumps(record, sort_keys=True, default=str)
 
 
 def load_records(raw: str) -> list[dict[str, Any]]:
@@ -243,11 +324,15 @@ def normalise_record(record: dict[str, Any], started_at_epoch: float | None) -> 
     if offset is None:
         return None
 
+    inline = [name for _, name in INLINE_EMOTE.findall(text)]
+    if inline:
+        text = INLINE_EMOTE.sub(lambda m: m.group(2), text).strip()
+
     return ChatMessage(
         offset_seconds=max(0.0, offset),
         username=username,
         text=text,
-        emotes=tuple(extract_emotes(record)),
+        emotes=tuple(extract_emotes(record) + inline),
     )
 
 
@@ -265,8 +350,6 @@ def extract_offset(record: dict[str, Any], started_at_epoch: float | None) -> fl
         if started_at_epoch is None:
             return None
         return raw - started_at_epoch
-
-    from .vod import parse_epoch
 
     for key in ("created_at", "sent_at", "time"):
         epoch = parse_epoch(record.get(key))
@@ -291,7 +374,12 @@ def extract_emotes(record: dict[str, Any]) -> list[str]:
 
 
 def build_chat_source(
-    kind: str, *, chat_file: Path | None = None, timeout: float = 30.0
+    kind: str,
+    *,
+    chat_file: Path | None = None,
+    timeout: float = 30.0,
+    auth_token: str | None = None,
+    workers: int = 8,
 ) -> ChatSource:
     if kind == "none":
         return NullChatSource()
@@ -300,5 +388,5 @@ def build_chat_source(
             raise ValueError("chat source 'file' requires a chat file path")
         return JsonlChatSource(chat_file)
     if kind == "kick":
-        return KickReplayChatSource(timeout=timeout)
+        return KickReplayChatSource(timeout=timeout, auth_token=auth_token, workers=workers)
     raise ValueError(f"unknown chat source: {kind}")

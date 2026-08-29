@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
     http_timeout: float = 30.0
+    kick_auth_token: str | None = None
+    kick_chat_workers: int = 8
     batch_poll_seconds: float = 60.0
 
     sampling: SamplingSettings = Field(default_factory=SamplingSettings)

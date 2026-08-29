@@ -5,7 +5,7 @@ from typer.testing import CliRunner
 
 from kick_vod_analyser import cli as cli_module
 from kick_vod_analyser.cli import app
-from kick_vod_analyser.models import VodInfo
+from kick_vod_analyser.models import ChatMessage, VodInfo
 
 runner = CliRunner()
 
@@ -24,10 +24,10 @@ class TestHelp:
     def test_lists_every_command(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        for command in ("analyse", "estimate", "info"):
+        for command in ("analyse", "estimate", "info", "chat"):
             assert command in result.stdout
 
-    @pytest.mark.parametrize("command", ["analyse", "estimate", "info"])
+    @pytest.mark.parametrize("command", ["analyse", "estimate", "info", "chat"])
     def test_each_command_documents_itself(self, command):
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code == 0
@@ -48,6 +48,60 @@ class TestInfo:
 
         monkeypatch.setattr(cli_module, "resolve_vod", boom)
         assert runner.invoke(app, ["info", "--url", VOD.url]).exit_code != 0
+
+
+class TestChat:
+    def _install(self, monkeypatch, messages, raw=None):
+        from kick_vod_analyser.ingest.chat import ChatIndex
+
+        monkeypatch.setattr(cli_module, "resolve_vod", lambda url, timeout=30.0: VOD)
+
+        class FakeSource:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def fetch(self, vod):
+                return ChatIndex(messages)
+
+            def download(self, vod):
+                return raw or []
+
+        monkeypatch.setattr(cli_module, "KickReplayChatSource", FakeSource)
+
+    def test_writes_normalised_jsonl(self, monkeypatch, tmp_path):
+        self._install(monkeypatch, [ChatMessage(offset_seconds=5, username="v", text="hi")])
+        target = tmp_path / "chat.jsonl"
+
+        result = runner.invoke(app, ["chat", "--url", VOD.url, "--out", str(target)])
+
+        assert result.exit_code == 0, result.stdout
+        assert "1 messages" in result.stdout
+        assert '"text":"hi"' in target.read_text(encoding="utf-8")
+
+    def test_raw_writes_kick_records(self, monkeypatch, tmp_path):
+        self._install(monkeypatch, [], raw=[{"id": "m1", "content": "yo", "sender": {"username": "v"}}])
+        target = tmp_path / "raw.jsonl"
+
+        result = runner.invoke(app, ["chat", "--url", VOD.url, "--out", str(target), "--raw"])
+
+        assert result.exit_code == 0, result.stdout
+        assert '"id": "m1"' in target.read_text(encoding="utf-8")
+
+    def test_defaults_to_the_vod_out_dir(self, monkeypatch, tmp_path):
+        self._install(monkeypatch, [ChatMessage(offset_seconds=5, username="v", text="hi")])
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["chat", "--url", VOD.url])
+
+        assert result.exit_code == 0, result.stdout
+        assert (tmp_path / "out" / "abc" / "chat.jsonl").exists()
+
+    def test_no_messages_exits_non_zero(self, monkeypatch, tmp_path):
+        self._install(monkeypatch, [])
+
+        result = runner.invoke(app, ["chat", "--url", VOD.url, "--out", str(tmp_path / "c.jsonl")])
+
+        assert result.exit_code == 1
 
 
 class TestEstimate:

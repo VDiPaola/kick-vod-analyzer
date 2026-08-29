@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,7 @@ from rich.table import Table
 
 from .classify.pricing import estimate_cost
 from .config import load_settings
-from .ingest.chat import build_chat_source
+from .ingest.chat import KickReplayChatSource, build_chat_source
 from .ingest.vod import resolve_vod
 from .pipeline import Pipeline, RunOptions, write_run_report
 from .postprocess.outputs import format_duration, format_timestamp
@@ -49,7 +50,9 @@ def analyse(
     provider: str = typer.Option("gemini", "--provider", "-p", help="gemini, openai, or mock."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override the provider model."),
     mode: str = typer.Option("sync", "--mode", help="sync or batch."),
-    chat: str = typer.Option("kick", "--chat", help="Chat source: kick, file, or none."),
+    chat: str = typer.Option(
+        "none", "--chat", help="Chat source: none, file, or kick (see README)."
+    ),
     chat_file: Optional[Path] = typer.Option(None, "--chat-file", help="Chat JSON or JSONL input."),
     scene_threshold: Optional[float] = typer.Option(
         None, "--scene-threshold", help="ffmpeg scene score cutoff, 0 to 1."
@@ -79,7 +82,13 @@ def analyse(
     if max_samples is not None:
         settings.sampling.max_samples = max_samples
 
-    source = build_chat_source(chat, chat_file=chat_file, timeout=settings.http_timeout)
+    source = build_chat_source(
+        chat,
+        chat_file=chat_file,
+        timeout=settings.http_timeout,
+        auth_token=settings.kick_auth_token,
+        workers=settings.kick_chat_workers,
+    )
     pipeline = Pipeline(settings, chat_source=source, progress=_progress)
 
     options = RunOptions(
@@ -152,6 +161,55 @@ def info(
     table.add_row("Started", str(vod.started_at_epoch or "-"))
     table.add_row("Playback", (vod.playback_url or "-")[:110])
     console.print(table)
+
+
+@app.command()
+def chat(
+    url: str = typer.Option(..., "--url", "-u", help="Kick VOD URL."),
+    out: Optional[Path] = typer.Option(
+        None, "--out", "-o", help="Output path. Defaults to out/<vod_id>/chat.jsonl."
+    ),
+    raw: bool = typer.Option(
+        False, "--raw", help="Write Kick's original records instead of the normalised format."
+    ),
+    workers: Optional[int] = typer.Option(None, "--workers", help="Parallel download threads."),
+    chunk_seconds: float = typer.Option(
+        600.0, "--chunk-seconds", help="VOD seconds walked per thread task."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Download the full chat replay for a VOD to a JSONL file."""
+    configure_logging(verbose)
+    settings = build_settings(None, None)
+    vod = resolve_vod(url, timeout=settings.http_timeout)
+    console.print(
+        f"[bold]{vod.channel_slug}[/bold] {vod.title or vod.vod_id} "
+        f"({format_duration(vod.duration_seconds)})"
+    )
+
+    source = KickReplayChatSource(
+        timeout=settings.http_timeout,
+        auth_token=settings.kick_auth_token,
+        workers=workers or settings.kick_chat_workers,
+        chunk_seconds=chunk_seconds,
+    )
+    target = out or settings.vod_out_dir(vod.vod_id) / "chat.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if raw:
+        records = source.download(vod)
+        with target.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        count = len(records)
+    else:
+        index = source.fetch(vod)
+        index.to_jsonl(target)
+        count = len(index)
+
+    console.print(f"[green]{count} messages[/green] -> {target}")
+    if count == 0:
+        raise typer.Exit(code=1)
 
 
 def _progress(stage: str, message: str) -> None:

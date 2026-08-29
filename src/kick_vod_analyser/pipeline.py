@@ -38,7 +38,7 @@ class RunOptions:
     provider: str = "gemini"
     model: str | None = None
     mode: str = "sync"
-    chat_source_kind: str = "kick"
+    chat_source_kind: str = "none"
     chat_file: Path | None = None
     resume: bool = True
     keep_frames: bool = False

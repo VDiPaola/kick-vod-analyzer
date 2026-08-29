@@ -168,7 +168,7 @@ cat out/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65/summary_report.md
 | `--provider` | `gemini` | `gemini`, `openai`, or `mock` |
 | `--model` | provider default | Override the model id |
 | `--mode` | `sync` | `sync` returns immediately; `batch` is half price with a 24h window |
-| `--chat` | `kick` | `kick`, `file`, or `none` |
+| `--chat` | `none` | `none`, `file`, or `kick` (see below) |
 | `--chat-file` | | Chat JSON or JSONL, required when `--chat file` |
 | `--scene-threshold` | `0.35` | Higher means fewer scene triggers |
 | `--heartbeat` | `900` | Seconds between fallback checkpoints |
@@ -181,33 +181,77 @@ cat out/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65/summary_report.md
 Use `mock` as the provider to exercise the whole pipeline without credentials or
 cost. It derives a deterministic verdict from each grid image.
 
-## Chat is optional
+## Chat
 
-**Kick publishes no VOD chat history API.** The replay the web player renders is
-served by an undocumented, Cloudflare-fronted endpoint that can change without
-notice.
+Kick publishes no documented VOD chat API, but the web player's replay endpoint
+is reachable without a login and returns complete history. The pipeline still
+treats chat as enrichment, not a dependency: every source degrades to an empty
+index rather than failing the run.
 
-The pipeline therefore treats chat as enrichment, not a dependency. Three
-sources are available:
+### Downloading chat on its own
 
-`--chat kick` walks the undocumented replay endpoint. When it fails, the run
-continues without chat rather than aborting:
+`chat` downloads the full replay for a VOD to a JSONL file. This works
+standalone, without ffmpeg or any model credentials:
+
+```bash
+python -m kick_vod_analyser.cli chat --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65"
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--out` | `out/<vod_id>/chat.jsonl` | Output path |
+| `--raw` | off | Write Kick's original records (ids, sender identity, badges) instead of the normalised format |
+| `--workers` | `8` | Parallel download threads |
+| `--chunk-seconds` | `600` | VOD seconds walked per thread task |
+
+An 8.6 hour VOD with 30,000 messages downloads in about 20 seconds with 16
+workers. The command exits non-zero when no messages were collected.
+
+The normalised format is one message per line:
+
+```json
+{"offset_seconds": 1234.0, "username": "viewer", "text": "PogU wow", "emotes": ["PogU"]}
+```
+
+Kick embeds emotes in message text as `[emote:<id>:<name>]`. The normaliser
+replaces each token with its name and lists the names under `emotes`.
+
+### How the download works
+
+`web.kick.com/api/v1/chat/{channel_id}/history` accepts two query forms:
+
+- `start_time=<ISO 8601>` returns one fixed five second bucket, floor aligned,
+  **truncated to its earliest 25 messages**. Busy moments lose chat.
+- `cursor=<epoch microseconds>` returns the 25 messages before the cursor,
+  newest first, plus the cursor for the next older page. Paging is complete.
+
+The downloader uses the cursor form. The VOD window is split into chunks of
+`--chunk-seconds`, and each chunk is walked backwards from its end on its own
+thread until a message older than the chunk start appears. Request count scales
+with message volume, not VOD length, and quiet stretches cost one request per
+chunk. Messages are deduplicated by id and sorted by `created_at`.
+
+Measured in August 2026: no authorization header is needed, and 16 concurrent
+workers were not throttled. `KVA_KICK_AUTH_TOKEN` is read if set and sent as a
+bearer token, for the case where Kick begins requiring one. `curl_cffi` (the
+`kick` extra) is still required to pass Cloudflare.
+
+### Chat sources for `analyse`
+
+`--chat kick` runs the same download inline and indexes the result:
 
 ```bash
 python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --chat kick
 ```
 
-`--chat none` skips chat entirely and classifies from the screenshots alone:
+`--chat none` (the default) skips chat entirely and classifies from the
+screenshots alone.
+
+`--chat file` loads an export from `chat` or any external scraper. `--chat-file`
+is required with it:
 
 ```bash
-python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --chat none
-```
-
-`--chat file` loads an export from any external scraper. `--chat-file` is
-required with it:
-
-```bash
-python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --chat file --chat-file ./my_chat_export.jsonl
+python -m kick_vod_analyser.cli analyse --url "https://kick.com/xqc/videos/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65" --chat file --chat-file ./out/709c0cd8-b2d5-4b9d-b47f-e969a84fcd65/chat.jsonl
 ```
 
 The loader accepts a JSON array, a JSON object with a `messages`/`comments`/`data`
@@ -296,6 +340,16 @@ A second run reuses both and classifies only what is new. `--no-resume` forces a
 fresh pass. Changing the model invalidates classifications but not scene
 detection, so trying a different model does not re-download the VOD.
 
+## Rate limits and transient errors
+
+Synchronous classification retries each request on rate-limit and server
+errors (HTTP 408, 429, 5xx, or messages mentioning quota, rate limit, or
+overload). Up to 8 attempts per request. The wait honours the provider's
+`Retry-After` header or Gemini's `retryDelay` hint when present, otherwise it
+backs off exponentially from 2s, capped at 120s. Free-tier quota exhaustion
+pauses the run instead of failing it. Errors that are not transient (bad API
+key, invalid request) are recorded against the sample and the run continues.
+
 ## Batch mode
 
 Batch halves the token price in exchange for an asynchronous turnaround of up to
@@ -340,6 +394,8 @@ flags taking precedence.
 | `KVA_SAMPLING_HEARTBEAT_SECONDS` | `900` |
 | `KVA_SAMPLING_MIN_GAP_SECONDS` | `45` |
 | `KVA_SAMPLING_PHASH_DISTANCE` | `6` |
+| `KVA_KICK_AUTH_TOKEN` | unset |
+| `KVA_KICK_CHAT_WORKERS` | `8` |
 | `KVA_CHAT_WINDOW_SECONDS` | `45` |
 | `KVA_CHAT_MAX_LINES` | `30` |
 | `KVA_SMOOTHING_MIN_SEGMENT_SECONDS` | `60` |
@@ -436,6 +492,24 @@ upgrade. Check what is actually in effect:
 python -c "from kick_vod_analyser.config import load_settings; print(load_settings().gemini_model)"
 ```
 
+**`404 NOT_FOUND` / `Kick video API returned 404` on a VOD that plays fine in a
+browser** — handled automatically, but worth understanding. Kick VOD URLs now
+carry a version 7 UUID that no read endpoint accepts, and that id appears
+nowhere in the API payloads. The resolver decodes the creation timestamp the v7
+id embeds, looks the channel's video listing up, and matches on time to recover
+the version 4 `video.uuid` the endpoints do accept. You will see this in the log:
+
+```
+mapped URL id to video uuid 1e7fa39e-09ad-47c5-9f25-f08eedafa16d (4.0s apart)
+```
+
+The listing only covers recent VODs, so an older one may no longer be findable.
+The `kick.com/video/<id>` form has no channel to look up and cannot be mapped;
+use `kick.com/<channel>/videos/<id>`.
+
+Because the mapping resolves to the canonical video id, `out/<vod_id>/` is named
+after the v4 id, not the id in the URL you pasted.
+
 **`GEMINI_API_KEY is not set`** — create `.env.local` in the project root with
 `GEMINI_API_KEY=your-key-here`, or export it in your shell.
 
@@ -491,8 +565,8 @@ src/kick_vod_analyser/
 
 ## Known limitations
 
-- **Chat replay is best-effort.** Kick's endpoint is undocumented and unversioned.
-  If it breaks, use `--chat file` with an external scraper's export.
+- **Chat replay is best-effort.** Kick's history endpoint is undocumented and
+  unversioned. If it breaks, use `--chat file` with an external scraper's export.
 - **Scene boundaries quantise to keyframes**, roughly two to four seconds. This
   is well inside the 60-second segment floor, so it does not affect the timeline.
 - **Live VODs report duration 0.** The pipeline falls back to probing the HLS
